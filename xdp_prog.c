@@ -1,17 +1,11 @@
 #include <bits/types.h>
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
+#include <linux/byteorder/little_endian.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <bpf/bpf_endian.h>
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, __u32);   // ip address
-    __type(value, __u32); // cookie
-} cookie_map SEC(".maps");
 
 static __u32 (*bpf_tcp_raw_gen_syncookie_v4)(struct iphdr *iph, struct tcphdr *th, __u32 th_len) = (void *) BPF_FUNC_tcp_raw_gen_syncookie_ipv4; // helper for cookie generation ipv4
 static __u32 (*bpf_tcp_raw_gen_syncookie_v6)(struct iphdr *iph, struct tcphdr *th, __u32 th_len) = (void *) BPF_FUNC_tcp_raw_gen_syncookie_ipv6; // helper for cookie generation ipv6
@@ -41,32 +35,40 @@ int handle_syn(struct xdp_md *ctx) {
             cookie = bpf_tcp_raw_gen_syncookie_v4(ip, tcp, sizeof(*tcp));
             if (!cookie) return XDP_DROP;
 
+            unsigned char tmp_mac[ETH_ALEN];
+            __builtin_memcpy(tmp_mac, eth->h_source, ETH_ALEN);
+            __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+            __builtin_memcpy(eth->h_dest, tmp_mac, ETH_ALEN);
 
-            bpf_map_update_elem(&cookie_map, &ip->saddr, &cookie, BPF_ANY); // save cookie
+            __be32 tmp_ip = ip->saddr;
+            ip->saddr = ip->daddr;
+            ip->daddr = tmp_ip;
+
+            __be16 tmp_port = tcp->source;
+            tcp->source = tcp->dest;
+            tcp->dest = tmp_port;
 
             tcp->ack = 1;
             tcp->syn = 1;
-            tcp->seq = 0;
-            tcp->ack_seq = bpf_htonl(bpf_ntohl(tcp->seq) + 1);
-
-            tcp->check = 0;
-            tcp->check = bpf_csum_diff((__be32 *)&ip->saddr, sizeof(ip->saddr), (__be32 *)&ip->daddr, sizeof(ip->daddr), 0);
-            tcp->check = bpf_csum_diff((__be32 *)&tcp, sizeof(*tcp), 0, 0, tcp->check);
 
             ip->check = 0;
-            ip->check = bpf_csum_diff((__be32 *)&ip, sizeof(*ip), 0, 0, 0);
+            ip->check = ~bpf_csum_diff(0, 0, ip, sizeof(*ip), 0) & 0xffff;
+
+            tcp->check = 0;
+            __u32 csum = bpf_csum_diff(0, 0, tcp, sizeof(*tcp), 0);
+            csum = bpf_csum_diff(0, 0, &ip->saddr, sizeof(ip->saddr), csum);
+            csum = bpf_csum_diff(0, 0, &ip->daddr, sizeof(ip->daddr), csum);
+            tcp->check = ~((csum & 0xffff) + (csum >> 16));
 
             return XDP_TX;
 
         } else if(tcp->ack && !tcp->syn){ // is packet ack && !syn?
-            __u32 *cookieExists = bpf_map_lookup_elem(&cookie_map, &ip->saddr);
+            __u32 cookieRec = bpf_ntohl(tcp->ack_seq) - 1;
+            __u32 cookieExp = bpf_tcp_raw_gen_syncookie_ipv4(ip, tcp, sizeof(*tcp));
 
-            if (!cookieExists) return XDP_DROP;
+            if (!cookieRec || !cookieExp) return XDP_DROP;
 
-            __u32 cookieRec = bpf_ntohl(tcp->seq);
-            if (cookieRec != *cookieExists) return XDP_DROP;
-
-            bpf_map_delete_elem(&cookie_map, &ip->saddr);
+            if(cookieRec != cookieExp) return XDP_DROP;
 
             return XDP_PASS;
 
@@ -76,7 +78,7 @@ int handle_syn(struct xdp_md *ctx) {
 
     // IPv6
     } else if(eth->h_proto == __constant_htons(ETH_P_IPV6)) {
-        
+
     }
 
 
